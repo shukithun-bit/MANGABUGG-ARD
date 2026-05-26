@@ -121,7 +121,8 @@ def init_db() -> None:
                 pending_referrer_id INTEGER,
                 free_spins INTEGER DEFAULT 1,
                 free_spins_updated_at TEXT,
-                free_spins_date TEXT
+                free_spins_date TEXT,
+                needs_nickname INTEGER DEFAULT 1
             )
         """)
         c.execute("""
@@ -256,6 +257,7 @@ def init_db() -> None:
                 media_type TEXT DEFAULT 'photo',
                 is_limited INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
+                rejection_reason TEXT,
                 reviewed_by INTEGER,
                 reviewed_at TEXT,
                 created_at TEXT NOT NULL,
@@ -271,11 +273,11 @@ def init_db() -> None:
             )
         """)
         for table, columns in {
-            "users": {"shards": "INTEGER DEFAULT 0", "spins": "INTEGER DEFAULT 0", "daily_streak": "INTEGER DEFAULT 0", "last_daily_at": "TEXT", "active_universe_id": "INTEGER", "nickname": "TEXT", "role": "TEXT DEFAULT 'player'", "premium_until": "TEXT", "referrer_id": "INTEGER", "pending_referrer_id": "INTEGER", "free_spins": "INTEGER DEFAULT 1", "free_spins_updated_at": "TEXT", "free_spins_date": "TEXT"},
+            "users": {"shards": "INTEGER DEFAULT 0", "spins": "INTEGER DEFAULT 0", "daily_streak": "INTEGER DEFAULT 0", "last_daily_at": "TEXT", "active_universe_id": "INTEGER", "nickname": "TEXT", "role": "TEXT DEFAULT 'player'", "premium_until": "TEXT", "referrer_id": "INTEGER", "pending_referrer_id": "INTEGER", "free_spins": "INTEGER DEFAULT 1", "free_spins_updated_at": "TEXT", "free_spins_date": "TEXT", "needs_nickname": "INTEGER DEFAULT 0"},
             "universes": {"emoji": "TEXT DEFAULT '🌌'"},
             "card_templates": {"universe_id": "INTEGER", "points": "INTEGER DEFAULT 10", "media_type": "TEXT DEFAULT 'photo'", "is_limited": "INTEGER DEFAULT 0"},
             "cards": {"universe_id": "INTEGER", "points": "INTEGER DEFAULT 10", "media_type": "TEXT DEFAULT 'photo'", "is_limited": "INTEGER DEFAULT 0"},
-            "card_submissions": {"anime": "TEXT DEFAULT 'Mangabuff'", "points": "INTEGER DEFAULT 0", "media_type": "TEXT DEFAULT 'photo'", "is_limited": "INTEGER DEFAULT 0", "status": "TEXT DEFAULT 'pending'", "reviewed_by": "INTEGER", "reviewed_at": "TEXT"},
+            "card_submissions": {"anime": "TEXT DEFAULT 'Mangabuff'", "points": "INTEGER DEFAULT 0", "media_type": "TEXT DEFAULT 'photo'", "is_limited": "INTEGER DEFAULT 0", "status": "TEXT DEFAULT 'pending'", "rejection_reason": "TEXT", "reviewed_by": "INTEGER", "reviewed_at": "TEXT"},
         }.items():
             for col, ddl in columns.items():
                 if not column_exists(conn, table, col):
@@ -297,10 +299,53 @@ def ensure_user(user: types.User) -> None:
     username = user.username or user.full_name or "Игрок"
     with closing(db()) as conn:
         conn.execute("BEGIN")
-        conn.execute("INSERT OR IGNORE INTO users (id, username, coins, nickname) VALUES (?, ?, ?, ?)", (user.id, username, START_POINTS, username))
+        conn.execute("INSERT OR IGNORE INTO users (id, username, coins, nickname, needs_nickname) VALUES (?, ?, ?, NULL, 1)", (user.id, username, START_POINTS))
         conn.execute("UPDATE users SET username=? WHERE id=?", (username, user.id))
-        conn.execute("UPDATE users SET nickname=COALESCE(nickname, username) WHERE id=?", (user.id,))
         conn.commit()
+
+
+def needs_nickname(user_id: int) -> bool:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT needs_nickname, nickname FROM users WHERE id=?", (user_id,)).fetchone()
+    return bool(row and (row["needs_nickname"] or not row["nickname"]))
+
+
+def message_needs_nickname(message: types.Message) -> bool:
+    if not message.from_user:
+        return False
+    ensure_user(message.from_user)
+    return needs_nickname(message.from_user.id)
+
+
+def query_needs_nickname(query: types.CallbackQuery) -> bool:
+    if not query.from_user:
+        return False
+    ensure_user(query.from_user)
+    return needs_nickname(query.from_user.id)
+
+
+def valid_nickname(text: str) -> str | None:
+    nick = (text or "").strip()
+    if nick.startswith("/"):
+        return None
+    if len(nick) < 2:
+        return None
+    return nick[:32]
+
+
+async def save_initial_nickname(message: types.Message, state: FSMContext) -> None:
+    nick = valid_nickname(message.text or "")
+    if not nick:
+        await message.answer("Ник должен быть от 2 до 32 символов. Напиши его обычным сообщением.")
+        return
+    with closing(db()) as conn:
+        conn.execute("UPDATE users SET nickname=?, needs_nickname=0 WHERE id=?", (nick, message.from_user.id))
+    await state.clear()
+    await message.answer(
+        f"✅ Ник сохранён: <b>{e(nick)}</b>\n\nТеперь можно начинать.",
+        parse_mode="HTML",
+        reply_markup=main_reply_keyboard(message.from_user.id),
+    )
 
 
 def is_admin(user_id: int) -> bool:
@@ -519,6 +564,10 @@ class GiftSpins(StatesGroup):
 
 class NicknameChange(StatesGroup):
     waiting_nick = State()
+
+
+class ReviewSubmission(StatesGroup):
+    waiting_reject_reason = State()
 
 
 class SettingsAdmin(StatesGroup):
@@ -772,7 +821,27 @@ async def start(message: types.Message):
     if len(parts) == 2 and parts[1].startswith("ref_") and parts[1][4:].isdigit():
         register_pending_referral(message.from_user.id, int(parts[1][4:]))
     await remove_old_reply_keyboard(message)
+    if needs_nickname(message.from_user.id):
+        await message.answer(
+            "✨ <b>Добро пожаловать в MangabuffCard!</b>\n\n"
+            "Перед стартом придумай игровой ник. Он будет отображаться в профиле, топах и коллекции.\n\n"
+            "Напиши ник одним сообщением.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
     await message.answer(home_text(message.from_user), reply_markup=main_reply_keyboard(message.from_user.id), parse_mode="HTML")
+
+
+@dp.message(message_needs_nickname)
+async def onboarding_nickname(message: types.Message, state: FSMContext):
+    ensure_user(message.from_user)
+    await save_initial_nickname(message, state)
+
+
+@dp.callback_query(query_needs_nickname)
+async def onboarding_block_buttons(query: types.CallbackQuery):
+    await query.answer("Сначала придумай ник обычным сообщением.", show_alert=True)
 
 
 @dp.message(Command("menu"))
@@ -1120,26 +1189,51 @@ async def submission_approve(query: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("submission:reject:"))
-async def submission_reject(query: types.CallbackQuery):
+async def submission_reject(query: types.CallbackQuery, state: FSMContext):
     if not admin_guard(query):
         await query.answer("Нет доступа", show_alert=True)
         return
     submission_id = int(query.data.rsplit(":", 1)[1])
     with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM card_submissions WHERE id=? AND status='pending'", (submission_id,)).fetchone()
+        if not row:
+            await query.answer("Заявка уже обработана", show_alert=True)
+            return
+    await state.set_state(ReviewSubmission.waiting_reject_reason)
+    await state.update_data(submission_id=submission_id)
+    await edit_or_answer(query, f"❌ <b>Отклонение карты</b>\n\nКарта: <b>{e(row['name'])}</b>\nНапиши причину отказа. Она придёт автору карты.")
+    await query.answer()
+
+
+@dp.message(ReviewSubmission.waiting_reject_reason)
+async def submission_reject_reason(message: types.Message, state: FSMContext):
+    if not admin_guard(message):
+        return
+    reason = (message.text or "").strip()
+    if len(reason) < 2:
+        await message.answer("Причина слишком короткая. Напиши, почему карта отклонена.")
+        return
+    data = await state.get_data()
+    submission_id = int(data["submission_id"])
+    with closing(db()) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT * FROM card_submissions WHERE id=? AND status='pending'", (submission_id,)).fetchone()
         if not row:
             conn.rollback()
-            await query.answer("Заявка уже обработана", show_alert=True)
+            await state.clear()
+            await message.answer("Заявка уже обработана.", reply_markup=admin_menu_keyboard())
             return
-        conn.execute("UPDATE card_submissions SET status='rejected', reviewed_by=?, reviewed_at=? WHERE id=?", (query.from_user.id, datetime.utcnow().isoformat(), submission_id))
+        conn.execute(
+            "UPDATE card_submissions SET status='rejected', rejection_reason=?, reviewed_by=?, reviewed_at=? WHERE id=?",
+            (reason, message.from_user.id, datetime.utcnow().isoformat(), submission_id),
+        )
         conn.commit()
     try:
-        await bot.send_message(row["user_id"], f"❌ Твоя карта <b>{e(row['name'])}</b> отклонена.", parse_mode="HTML")
+        await bot.send_message(row["user_id"], f"❌ Твоя карта <b>{e(row['name'])}</b> отклонена.\n\nПричина: <b>{e(reason)}</b>", parse_mode="HTML")
     except (TelegramForbiddenError, TelegramBadRequest):
         pass
-    await edit_or_answer(query, "❌ Карта отклонена.", submissions_keyboard())
-    await query.answer()
+    await state.clear()
+    await message.answer("❌ Карта отклонена, причина отправлена автору.", reply_markup=submissions_keyboard(), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "admin:universes")
@@ -1650,7 +1744,7 @@ async def nick_command(message: types.Message, state: FSMContext):
     if len(parts) == 2 and parts[1].strip():
         nick = parts[1].strip()[:32]
         with closing(db()) as conn:
-            conn.execute("UPDATE users SET nickname=? WHERE id=?", (nick, message.from_user.id))
+            conn.execute("UPDATE users SET nickname=?, needs_nickname=0 WHERE id=?", (nick, message.from_user.id))
         await message.answer(f"✅ Игровой ник изменён: <b>{e(nick)}</b>", parse_mode="HTML", reply_markup=main_menu_keyboard())
     else:
         await state.set_state(NicknameChange.waiting_nick)
@@ -1664,7 +1758,7 @@ async def nick_waiting(message: types.Message, state: FSMContext):
         await message.answer("Ник слишком короткий.")
         return
     with closing(db()) as conn:
-        conn.execute("UPDATE users SET nickname=? WHERE id=?", (nick, message.from_user.id))
+        conn.execute("UPDATE users SET nickname=?, needs_nickname=0 WHERE id=?", (nick, message.from_user.id))
     await state.clear()
     await message.answer(f"✅ Игровой ник изменён: <b>{e(nick)}</b>", parse_mode="HTML", reply_markup=main_menu_keyboard())
 
@@ -2417,6 +2511,7 @@ async def top_text(user_id: int) -> str:
 def top_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏆 По картам", callback_data="top:points"), InlineKeyboardButton(text="🔗 По рефералам", callback_data="top:refs")],
+        [InlineKeyboardButton(text="➕ По созданным картам", callback_data="top:created")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:home")],
     ])
 
@@ -2435,6 +2530,23 @@ async def referral_top_text() -> str:
     if not rows:
         return "🔗 <b>Топ по рефералам</b>\n\nПока нет приглашённых игроков."
     return "🔗 <b>Топ по рефералам</b>\n\n" + "\n".join(f"{i}. <b>{e(display_name(r))}</b> — 👥 {r['refs']}" for i, r in enumerate(rows, 1))
+
+
+async def created_cards_top_text() -> str:
+    with closing(db()) as conn:
+        rows = conn.execute("""
+            SELECT u.id, u.username, u.nickname, COUNT(ct.id) AS created_cards
+            FROM users u
+            JOIN card_templates ct ON ct.created_by = u.id
+            WHERE ct.is_active=1
+            GROUP BY u.id
+            HAVING created_cards > 0
+            ORDER BY created_cards DESC, u.id ASC
+            LIMIT 10
+        """).fetchall()
+    if not rows:
+        return "➕ <b>Топ по созданным картам</b>\n\nПока нет принятых карт от пользователей."
+    return "➕ <b>Топ по созданным картам</b>\n\n" + "\n".join(f"{i}. <b>{e(display_name(r))}</b> — 🃏 {r['created_cards']}" for i, r in enumerate(rows, 1))
 
 
 @dp.message(Command("top"))
@@ -2462,6 +2574,13 @@ async def top_points_button(query: types.CallbackQuery):
 async def top_refs_button(query: types.CallbackQuery):
     ensure_user(query.from_user)
     await edit_or_answer(query, await referral_top_text(), top_keyboard())
+    await query.answer()
+
+
+@dp.callback_query(F.data == "top:created")
+async def top_created_button(query: types.CallbackQuery):
+    ensure_user(query.from_user)
+    await edit_or_answer(query, await created_cards_top_text(), top_keyboard())
     await query.answer()
 
 
