@@ -1179,9 +1179,10 @@ async def submission_approve(query: types.CallbackQuery):
             VALUES (0, ?, ?, ?, ?, ?, 0, ?, ?, ?, 1, ?, ?)
         """, (row["name"], row["anime"], row["rarity"], row["emoji"], row["price"], row["image_path"], row["media_type"], row["is_limited"], row["user_id"], datetime.utcnow().isoformat()))
         conn.execute("UPDATE card_submissions SET status='approved', reviewed_by=?, reviewed_at=? WHERE id=?", (query.from_user.id, datetime.utcnow().isoformat(), submission_id))
+        conn.execute("UPDATE users SET spins=spins+1 WHERE id=?", (row["user_id"],))
         conn.commit()
     try:
-        await bot.send_message(row["user_id"], f"✅ Твоя карта <b>{e(row['name'])}</b> принята и добавлена в пул.", parse_mode="HTML")
+        await bot.send_message(row["user_id"], f"✅ Твоя карта <b>{e(row['name'])}</b> принята и добавлена в пул.\n\n🎟 За создание карты начислена <b>+1 крутка</b>.", parse_mode="HTML")
     except (TelegramForbiddenError, TelegramBadRequest):
         pass
     await edit_or_answer(query, "✅ Карта принята.", submissions_keyboard())
